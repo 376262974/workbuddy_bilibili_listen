@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec.bak
+
+# 本地二进制依赖（体积过大，不入库）
+bin/
+
+# WorkBuddy 会话数据
+.workbuddy/
+
+# 临时/日志文件
+_del_result.txt
+build_exe.log
+*.log
