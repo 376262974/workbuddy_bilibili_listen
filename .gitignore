@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# 测试代码，不入库
+test_*.py
+
 # PyInstaller 构建产物
 build/
 build_new/
