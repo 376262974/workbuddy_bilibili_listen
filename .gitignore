@@ -7,7 +7,9 @@ venv/
 
 # PyInstaller 构建产物
 build/
+build_new/
 dist/
+dist_new/
 *.spec.bak
 
 # 本地二进制依赖（体积过大，不入库）
@@ -15,6 +17,9 @@ bin/
 
 # WorkBuddy 会话数据
 .workbuddy/
+
+# 本地数据（用户历史/收藏，每台机器不同）
+history.json
 
 # 临时/日志文件
 _del_result.txt

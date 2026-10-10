@@ -23,6 +23,7 @@ import os
 import sys
 import json
 import queue
+import tempfile
 import subprocess
 import threading
 import time
@@ -47,6 +48,7 @@ CHUNK_FRAMES = 4096         # 每次写入的帧数
 CHUNK_BYTES = CHUNK_FRAMES * CHANNELS * SAMPLE_WIDTH
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+HISTORY_MAX = 200
 
 
 def _write_error_log(msg):
@@ -59,6 +61,87 @@ def _write_error_log(msg):
             f.write("[{0}]\n{1}\n{2}\n".format(ts, msg, "-" * 60))
     except Exception:
         pass
+
+
+# --------------------------------------------------------------------------- #
+# 历史 / 收藏持久化
+# --------------------------------------------------------------------------- #
+def data_dir():
+    """可写数据目录。
+
+    PyInstaller 单文件模式下 __file__ 指向临时解包目录（退出即删），
+    所以打包后要用 exe 所在目录；若该目录不可写（如 Program Files）则回退 LOCALAPPDATA。
+    """
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else APP_DIR
+    try:
+        os.makedirs(base, exist_ok=True)
+        probe = os.path.join(base, ".writetest.tmp")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("1")
+        os.remove(probe)
+        return base
+    except Exception:
+        alt = os.path.join(
+            os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+            "bili_audio_player",
+        )
+        try:
+            os.makedirs(alt, exist_ok=True)
+        except Exception:
+            pass
+        return alt
+
+
+def history_path():
+    return os.path.join(data_dir(), "history.json")
+
+
+def load_history():
+    """读取历史记录，最新在前；任何异常都退化为空列表。"""
+    try:
+        with open(history_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("items") if isinstance(data, dict) else data
+        items = []
+        for it in raw or []:
+            if isinstance(it, dict) and it.get("url"):
+                items.append({
+                    "url": str(it["url"]),
+                    "title": str(it.get("title") or ""),
+                    "count": int(it.get("count") or 0),
+                    "ts": float(it.get("ts") or 0),
+                })
+        items.sort(key=lambda x: x["ts"], reverse=True)
+        return items
+    except Exception:
+        return []
+
+
+def save_history(items):
+    try:
+        with open(history_path(), "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "items": list(items)[:HISTORY_MAX]},
+                      f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        _write_error_log("保存历史失败：%s" % e)
+        return False
+
+
+def add_history(items, url, title="", count=0):
+    """记录一条链接：同 url 覆盖并置顶，超出上限丢弃最旧的。返回新列表。"""
+    url = (url or "").strip()
+    if not url:
+        return items
+    items = [x for x in items if x.get("url") != url]
+    items.insert(0, {
+        "url": url,
+        "title": title or "",
+        "count": int(count or 0),
+        "ts": time.time(),
+    })
+    del items[HISTORY_MAX:]
+    return items
 
 
 # --------------------------------------------------------------------------- #
@@ -629,6 +712,11 @@ class App:
         self.audio_format = None
         self.audio_qualities = []     # [{"id","abr","ext","acodec"}]
         self._quality_labels = []
+        # 历史 / 收藏
+        self.history = load_history()
+        self.history_win = None
+        self.history_dlg = None
+        self.auto_hist_var = tk.BooleanVar(value=True)
         # 线程安全的 UI 消息队列：工作线程只往这里投递，主线程统一执行
         self.ui_queue = queue.Queue()
 
@@ -639,6 +727,7 @@ class App:
 
         self._build_ui()
         self._refresh_ffmpeg_status()
+        self._restore_last_link()
         self._poll()
 
     # ---- 线程安全的 UI 调度 ---------------------------------------------- #
@@ -669,6 +758,8 @@ class App:
         self.entry = ttk.Entry(frm, textvariable=self.url_var, width=48)
         self.entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.entry.bind("<Return>", lambda e: self.on_toggle())
+        ttk.Button(frm, text="⭐ 收藏", width=8, command=self.on_favorite).pack(side="left", padx=(6, 0))
+        ttk.Button(frm, text="📂 历史", width=8, command=self.on_open_history).pack(side="left", padx=(6, 0))
 
         ctrl = ttk.Frame(self.root)
         ctrl.pack(fill="x", **pad)
@@ -682,6 +773,13 @@ class App:
         self.btn_next.pack(side="left", padx=(6, 0))
         self.loop_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(ctrl, text="列表循环", variable=self.loop_var).pack(side="left", padx=(10, 0))
+
+        # 历史记录开关
+        hist = ttk.Frame(self.root)
+        hist.pack(fill="x", padx=10, pady=(0, 2))
+        ttk.Checkbutton(hist, text="自动记录播放历史", variable=self.auto_hist_var).pack(side="left")
+        self.hist_hint = tk.StringVar(value="")
+        ttk.Label(hist, textvariable=self.hist_hint, foreground="#555555").pack(side="left", padx=(10, 0))
 
         # 进度条
         prog = ttk.Frame(self.root)
@@ -764,14 +862,86 @@ class App:
         toolmenu = tk.Menu(menubar, tearoff=0)
         toolmenu.add_command(label="下载 ffmpeg（如缺失）", command=self.on_download_ffmpeg)
         toolmenu.add_command(label="打开 ffmpeg 官网", command=lambda: self._open("https://www.gyan.dev/ffmpeg/builds/"))
+        toolmenu.add_separator()
+        toolmenu.add_command(label="历史 / 收藏链接  (Ctrl+H)", command=self.on_open_history)
         menubar.add_cascade(label="工具", menu=toolmenu)
         self.root.config(menu=menubar)
+        self.root.bind_all("<Control-h>", lambda e: self.on_open_history())
+        self.root.bind_all("<Control-H>", lambda e: self.on_open_history())
 
     def _refresh_ffmpeg_status(self):
         if self.ffmpeg:
             self.status_var.set(f"就绪（ffmpeg: {os.path.basename(self.ffmpeg)}）")
         else:
             self.status_var.set("⚠ 未找到 ffmpeg，请点「工具 → 下载 ffmpeg」")
+
+    # ---- 历史 / 收藏 ---------------------------------------------------- #
+    def _restore_last_link(self):
+        """启动时把最近一条记录填入输入框（不自动播放）。"""
+        n = len(self.history)
+        self.hist_hint.set(f"已保存 {n} 条记录" if n else "暂无记录")
+        if self.history:
+            self.url_var.set(self.history[0]["url"])
+            self.status_var.set(f"已载入上次链接（共 {n} 条记录，点『📂 历史』可切换）")
+
+    def _record_history(self, url, title="", count=0):
+        try:
+            url = normalize_url(url)
+            if not url:
+                return
+            self.history = add_history(self.history, url, title, count)
+            save_history(self.history)
+            self.hist_hint.set(f"已保存 {len(self.history)} 条记录")
+        except Exception:
+            pass
+
+    def set_history(self, items):
+        """供历史窗口调用：替换全量记录并落盘。"""
+        self.history = list(items)
+        save_history(self.history)
+        self.hist_hint.set(f"已保存 {len(self.history)} 条记录")
+
+    def on_favorite(self):
+        url = normalize_url(self.url_var.get())
+        if not url:
+            messagebox.showinfo("提示", "请先粘贴或载入 B 站链接，再点收藏。")
+            return
+        title = ""
+        if self.playlist and self.cur_idx is not None and self.cur_idx < len(self.playlist):
+            title = self.playlist[self.cur_idx].get("title") or ""
+        if not title and self.playlist:
+            title = self.playlist[0].get("title") or ""
+        self.url_var.set(url)
+        self._record_history(url, title, len(self.playlist))
+        self.status_var.set("已收藏：" + (title or url)[:60])
+
+    def on_open_history(self):
+        if self.history_win is not None:
+            try:
+                if self.history_win.winfo_exists():
+                    self.history_win.lift()
+                    self.history_win.focus_force()
+                    return
+            except Exception:
+                pass
+        self.history_dlg = HistoryDialog(self.root, self)
+        self.history_win = self.history_dlg.win
+
+    def load_from_history(self, url, play=False):
+        """从历史记录载入链接；play=True 时立即开始播放。"""
+        if not url:
+            return
+        self.url_var.set(url)
+        if not play:
+            self.status_var.set("已填入链接，点『▶ 开始』播放：" + url[:60])
+            return
+        if self.engine:
+            self.engine.stop()
+        self.playlist = []
+        self.cur_idx = None
+        self._cache.clear()
+        self._prefetching.clear()
+        self._start_new()
 
     # ---- 登录态（大会员 / 受限内容）------------------------------------ #
     def _cookie_args(self):
@@ -880,6 +1050,11 @@ class App:
 
         # 枚举该视频的纯音频格式，填充音质下拉框（默认最高）
         self._populate_quality(entries[0]["url"] if entries else None)
+
+        # 自动记录到历史（标题优先取解析出的第一条）
+        if self.auto_hist_var.get():
+            first_title = (entries[0].get("title") or "") if entries else ""
+            self._record_history(self.url_var.get(), first_title, len(entries))
 
         self._populate_list()
         self.status_var.set(f"共 {len(entries)} 个条目")
@@ -1191,6 +1366,136 @@ class App:
         except Exception as e:
             self.post(lambda: messagebox.showerror("下载失败", str(e)))
             self.post(self.status_var.set, "ffmpeg 下载失败，请手动下载并放到 bin/。")
+
+
+# --------------------------------------------------------------------------- #
+# 历史 / 收藏窗口
+# --------------------------------------------------------------------------- #
+class HistoryDialog:
+    """历史 / 收藏链接窗口：搜索、加载、删除、清空。
+
+    不直接继承 tk.Toplevel，是为了在没有 tkinter 的环境下模块也能被 import。
+    """
+
+    def __init__(self, master, app):
+        self.app = app
+        self.items = list(app.history)
+        self.filtered = list(self.items)
+
+        win = self.win = tk.Toplevel(master)
+        win.title("历史 / 收藏")
+        win.geometry("760x460")
+        win.minsize(560, 360)
+        win.transient(master)
+
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=10, pady=8)
+        ttk.Label(top, text="搜索：").pack(side="left")
+        self.filter_var = tk.StringVar()
+        e = ttk.Entry(top, textvariable=self.filter_var, width=32)
+        e.pack(side="left", padx=(4, 8))
+        e.bind("<KeyRelease>", lambda ev: self.refresh())
+        ttk.Label(top, text="（匹配标题或链接，双击直接播放）").pack(side="left")
+
+        box = ttk.Frame(win)
+        box.pack(fill="both", expand=True, padx=10)
+        self.listbox = tk.Listbox(box, font=("Microsoft YaHei UI", 9), activestyle="dotbox")
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.listbox.pack(side="left", fill="both", expand=True)
+        self.listbox.bind("<Double-Button-1>", lambda ev: self.load(play=True))
+        self.listbox.bind("<<ListboxSelect>>", lambda ev: self.show_detail())
+        self.listbox.bind("<Delete>", lambda ev: self.delete())
+        self.listbox.bind("<Return>", lambda ev: self.load(play=True))
+
+        self.detail_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=self.detail_var, anchor="w",
+                  foreground="#555555", wraplength=720).pack(fill="x", padx=10, pady=(6, 0))
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=10, pady=8)
+        ttk.Button(bar, text="▶ 加载并播放", command=lambda: self.load(play=True)).pack(side="left")
+        ttk.Button(bar, text="仅填入链接", command=lambda: self.load(play=False)).pack(side="left", padx=6)
+        ttk.Button(bar, text="删除", command=self.delete).pack(side="left", padx=6)
+        ttk.Button(bar, text="清空全部", command=self.clear_all).pack(side="left", padx=6)
+        ttk.Button(bar, text="关闭", command=self.close).pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh()
+        if self.filtered:
+            self.listbox.selection_set(0)
+            self.show_detail()
+        try:
+            e.focus_set()
+        except Exception:
+            pass
+
+    # ---- 数据 ----------------------------------------------------------- #
+    def refresh(self):
+        kw = self.filter_var.get().strip().lower()
+        if kw:
+            self.filtered = [x for x in self.items
+                             if kw in x["url"].lower() or kw in (x.get("title") or "").lower()]
+        else:
+            self.filtered = list(self.items)
+        self.listbox.delete(0, tk.END)
+        for it in self.filtered:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(it["ts"])) if it.get("ts") else "  --  "
+            title = (it.get("title") or "").strip() or it["url"]
+            cnt = "  [{}P]".format(it["count"]) if it.get("count") else ""
+            self.listbox.insert(tk.END, "{}  {}{}".format(ts, title, cnt))
+        self.win.title("历史 / 收藏（{}）".format(len(self.filtered)))
+
+    def _sel_item(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return None
+        i = sel[0]
+        if 0 <= i < len(self.filtered):
+            return self.filtered[i]
+        return None
+
+    def show_detail(self):
+        it = self._sel_item()
+        self.detail_var.set(it["url"] if it else "")
+
+    # ---- 操作 ----------------------------------------------------------- #
+    def load(self, play=False):
+        it = self._sel_item()
+        if not it:
+            messagebox.showinfo("提示", "请先选择一条记录。", parent=self.win)
+            return
+        url = it["url"]
+        self.close()
+        self.app.load_from_history(url, play=play)
+
+    def delete(self):
+        it = self._sel_item()
+        if not it:
+            return
+        self.items = [x for x in self.items if x["url"] != it["url"]]
+        self.app.set_history(self.items)
+        self.refresh()
+
+    def clear_all(self):
+        if not self.items:
+            return
+        if not messagebox.askyesno("确认", "确定清空全部历史 / 收藏记录？", parent=self.win):
+            return
+        self.items = []
+        self.app.set_history([])
+        self.refresh()
+
+    def close(self):
+        try:
+            self.app.history_win = None
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
