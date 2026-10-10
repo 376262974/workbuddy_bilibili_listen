@@ -34,8 +34,18 @@ try:
 except Exception:
     tk = None
     _HAVE_TK = False
-import numpy as np
-import pyaudio
+try:
+    import numpy as np
+    import pyaudio
+except ImportError:
+    sys.stderr.write(
+        "错误：缺少第三方依赖（numpy / pyaudio）。\n"
+        "本程序需要用项目自带的虚拟环境运行，而不是直接用 `python`：\n"
+        "  方式一：双击 run.bat 启动（自动选 dist 里的 exe，否则用 .venv）\n"
+        "  方式二：.\venv\\Scripts\\python.exe bili_audio_player.py\n"
+        "（当前 python 指向：%s，未安装这些库）\n" % sys.executable
+    )
+    sys.exit(1)
 
 # --------------------------------------------------------------------------- #
 # 常量
@@ -704,6 +714,7 @@ class App:
         self.playlist = []        # [{"url","title","duration"}]
         self.cur_idx = None       # 当前播放序号
         self._loading = False     # 正在解析某一首
+        self._loaded_url = None   # 已解析播放列表对应的链接（用于「开始」时判断是否需重新解析）
         self._cache = {}          # idx -> (audio_url, headers, title, duration)
         self._prefetching = set()
         self._fail_streak = 0
@@ -765,6 +776,8 @@ class App:
         ctrl.pack(fill="x", **pad)
         self.btn_toggle = ttk.Button(ctrl, text="▶ 开始", width=12, command=self.on_toggle)
         self.btn_toggle.pack(side="left")
+        self.btn_load = ttk.Button(ctrl, text="📥 加载", width=10, command=self.on_load)
+        self.btn_load.pack(side="left", padx=(6, 0))
         self.btn_stop = ttk.Button(ctrl, text="⏹ 停止", width=10, command=self.on_stop)
         self.btn_stop.pack(side="left", padx=(6, 0))
         self.btn_prev = ttk.Button(ctrl, text="⏮ 上一首", width=10, command=self.on_prev)
@@ -1003,6 +1016,15 @@ class App:
         webbrowser.open(url)
 
     # ---- 事件 ------------------------------------------------------------ #
+    def on_load(self):
+        """仅解析并加载用户填写的链接（分P列表 / 音质），不自动播放。"""
+        if not self.ffmpeg:
+            messagebox.showwarning("缺少 ffmpeg", "请先通过「工具 → 下载 ffmpeg」获取解码器。")
+            return
+        if self._resolving or self._loading:
+            return
+        self._start_new(autoplay=False)
+
     def on_toggle(self):
         if not self.ffmpeg:
             messagebox.showwarning("缺少 ffmpeg", "请先通过「工具 → 下载 ffmpeg」获取解码器。")
@@ -1015,12 +1037,16 @@ class App:
         elif st == "loading" or self._loading or self._resolving:
             return
         else:  # idle / finished / error / None
-            if self.playlist and self.cur_idx is not None:
+            url = normalize_url(self.url_var.get())
+            # 已加载过该链接的播放列表：直接播放当前/第一首，无需重新解析
+            if url and url == self._loaded_url and self.playlist:
+                self._play_index(self.cur_idx if self.cur_idx is not None else 0)
+            elif self.playlist and self.cur_idx is not None:
                 self._play_index(self.cur_idx)     # 重播当前这首
             else:
-                self._start_new()
+                self._start_new(autoplay=True)
 
-    def _start_new(self):
+    def _start_new(self, autoplay=True):
         url = normalize_url(self.url_var.get())
         if not url:
             messagebox.showinfo("提示", "请先粘贴 B 站视频链接。")
@@ -1029,18 +1055,19 @@ class App:
         if self._resolving:
             return
         self._resolving = True
+        self._loaded_url = url
         self.btn_toggle.config(state="disabled")
         self.status_var.set("正在解析链接与分P列表...")
-        threading.Thread(target=self._resolve_playlist_thread, args=(url,), daemon=True).start()
+        threading.Thread(target=self._resolve_playlist_thread, args=(url, autoplay), daemon=True).start()
 
-    def _resolve_playlist_thread(self, url):
+    def _resolve_playlist_thread(self, url, autoplay):
         try:
             entries = resolve_playlist(url, cookie_args=self._cookie_args())
-            self.post(self._after_playlist, entries)
+            self.post(self._after_playlist, entries, autoplay)
         except Exception as e:
             self.post(self._resolve_failed, str(e))
 
-    def _after_playlist(self, entries):
+    def _after_playlist(self, entries, autoplay):
         self._resolving = False
         self.btn_toggle.config(state="normal")
         self.playlist = entries
@@ -1057,8 +1084,11 @@ class App:
             self._record_history(self.url_var.get(), first_title, len(entries))
 
         self._populate_list()
-        self.status_var.set(f"共 {len(entries)} 个条目")
-        self._play_index(0)
+        if autoplay:
+            self.status_var.set(f"共 {len(entries)} 个条目")
+            self._play_index(0)
+        else:
+            self.status_var.set(f"已加载 {len(entries)} 个条目，点『▶ 开始』播放")
 
     def _populate_quality(self, url):
         quals = []
