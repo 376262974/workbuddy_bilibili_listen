@@ -21,6 +21,10 @@ bin/
 # 本地数据（用户历史/收藏，每台机器不同）
 history.json
 
+# 登录凭证，绝不能入库
+cookies.txt
+*.cookies.txt
+
 # 临时/日志文件
 _del_result.txt
 build_exe.log
